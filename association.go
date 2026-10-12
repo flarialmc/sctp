@@ -351,6 +351,7 @@ type Association struct {
 	streams              map[uint16]*Stream
 	acceptCh             chan *Stream
 	readLoopCloseCh      chan struct{}
+	writeLoopDoneCh      chan struct{} // Closed only after writeLoop can no longer attempt ABORT.
 	awakeWriteLoopCh     chan struct{}
 	closeWriteLoopCh     chan struct{}
 	handshakeCompletedCh chan error
@@ -832,6 +833,7 @@ func createAssociationFromConfigWithTsn(cfg *Config, tsn uint32) *Association {
 		reconfigRequests:        map[uint32]*paramOutgoingResetRequest{},
 		acceptCh:                make(chan *Stream, acceptChSize),
 		readLoopCloseCh:         make(chan struct{}),
+		writeLoopDoneCh:         make(chan struct{}),
 		awakeWriteLoopCh:        make(chan struct{}, 1),
 		closeWriteLoopCh:        make(chan struct{}),
 		handshakeCompletedCh:    make(chan error),
@@ -1105,6 +1107,7 @@ func (a *Association) Abort(reason string) {
 	// (readLoop exit closes closeWriteLoopCh and can race the ABORT send).
 	select {
 	case <-a.abortSentCh:
+	case <-a.writeLoopDoneCh:
 	case <-time.After(flushTimeout):
 	}
 
@@ -1115,9 +1118,10 @@ func (a *Association) Abort(reason string) {
 	// Wait for readLoop to end
 	<-a.readLoopCloseCh
 
-	// Ensure ABORT write was at least attempted before returning (bounded).
+	// Wait for an ABORT attempt or writer completion before returning (bounded).
 	select {
 	case <-a.abortSentCh:
+	case <-a.writeLoopDoneCh:
 	case <-time.After(flushTimeout):
 	}
 }
@@ -1188,6 +1192,7 @@ func (a *Association) readLoop() {
 
 func (a *Association) writeLoop() { // nolint:cyclop
 	a.log.Debugf("[%s] writeLoop entered", a.name)
+	defer close(a.writeLoopDoneCh)
 	defer a.log.Debugf("[%s] writeLoop exited", a.name)
 
 loop:
